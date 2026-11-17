@@ -550,6 +550,12 @@ class BlockPool:
         Returns:
             A list of new block.
         """
+        if num_blocks <= 0:
+            # A non-positive request must never reach popleft_n(): with n<0 it
+            # would inflate the free counter via `num_free_blocks -= n` while
+            # `range(n)` pops nothing, drifting the counter off the free-list.
+            return []
+
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 

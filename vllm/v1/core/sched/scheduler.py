@@ -305,6 +305,11 @@ class Scheduler(SchedulerInterface):
         # FIFO of (fence_seq, blocks): blocks become safe to free once
         # processed_step_seq >= fence_seq.
         self.deferred_frees: deque[tuple[int, list[KVCacheBlock]]] = deque()
+        self._skipped_free_fence_logged = False
+        if self.defer_block_free:
+            for manager in self.kv_cache_manager.coordinator.single_type_managers:
+                manager.free_skipped_blocks = self._free_skipped_blocks
+            logger.info("SWA eviction fence enabled for overlapping KV consumers")
 
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -540,6 +545,12 @@ class Scheduler(SchedulerInterface):
 
                     if new_blocks is not None:
                         # The request can be scheduled.
+                        break
+
+                    # Reclaim in-flight blocks before preempting for a
+                    # temporary shortage. The engine drains the oldest batch
+                    # even when this scheduling step contains no tokens.
+                    if self.deferred_frees:
                         break
 
                     # The request cannot be scheduled.
@@ -2141,6 +2152,23 @@ class Scheduler(SchedulerInterface):
         blocks = self.kv_cache_manager.pop_blocks_for_free(request)
         if blocks:
             self.deferred_frees.append((self.sched_step_seq, blocks))
+
+    def _free_skipped_blocks(self, blocks: list[KVCacheBlock]) -> None:
+        # SWA eviction happens during schedule(), before the previous batch
+        # is processed. Keep its references until that batch completes so a
+        # connector cannot reload into pages that are still read or written.
+        if self.sched_step_seq > self.processed_step_seq:
+            # SWA supplies tail-first blocks; the shared drain reverses its
+            # entries for request-end frees. Preserve SWA's immediate order.
+            self.deferred_frees.append((self.sched_step_seq, list(reversed(blocks))))
+            if not self._skipped_free_fence_logged:
+                logger.info(
+                    "SWA eviction fence active: held=%d fence=%d processed=%d",
+                    len(blocks), self.sched_step_seq, self.processed_step_seq,
+                )
+                self._skipped_free_fence_logged = True
+        else:
+            self.kv_cache_manager.block_pool.free_blocks(blocks)
 
     def _drain_deferred_frees(self):
         """Return deferred blocks whose fence step has completed.
