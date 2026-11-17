@@ -71,6 +71,8 @@ class SingleTypeKVCacheManager(ABC):
             self.block_size *= dcp_world_size * pcp_world_size
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
+        # The scheduler may fence sliding-window eviction against in-flight batches.
+        self.free_skipped_blocks = block_pool.free_blocks
         self.enable_caching = enable_caching
         self._max_admission_blocks_per_request = max_admission_blocks_per_request
         self.new_block_ids: list[int] = []
@@ -264,9 +266,16 @@ class SingleTypeKVCacheManager(ABC):
             return
 
         req_blocks = self.req_to_blocks[request_id]
-        allocated_blocks = self.block_pool.get_new_blocks(
+        num_blocks_to_alloc = (
             cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
         )
+        if num_blocks_to_alloc <= 0:
+            # The request's block list already covers (or exceeds) the computed
+            # tokens (e.g. null-padded skipped blocks), so there are no external
+            # blocks to allocate. Passing a non-positive count to get_new_blocks
+            # would inflate the free-list counter via popleft_n(n<0).
+            return
+        allocated_blocks = self.block_pool.get_new_blocks(num_blocks_to_alloc)
         req_blocks.extend(allocated_blocks)
         if type(self.kv_cache_spec) in (
             FullAttentionSpec,
@@ -502,7 +511,7 @@ class SingleTypeKVCacheManager(ABC):
             freed.append(blocks[i])
             blocks[i] = self._null_block
         if freed:
-            self.block_pool.free_blocks(freed)
+            self.free_skipped_blocks(freed)
 
     def remove_skipped_blocks(
         self,

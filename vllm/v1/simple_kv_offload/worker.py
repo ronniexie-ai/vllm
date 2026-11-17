@@ -221,6 +221,10 @@ class SimpleCPUOffloadWorker:
             - finished_sending: always None (stores use worker metadata).
             - finished_recving: req_ids whose loads have completed.
         """
+        check_error = getattr(self._backend, "check_error", None)
+        if check_error is not None:
+            check_error()
+
         # (1) Submit transfers
         metadata = self._connector_metadata
         if metadata is not None:
@@ -285,14 +289,23 @@ class SimpleCPUOffloadWorker:
         self._flush_and_sync_all()
 
     def _flush_and_sync_all(self) -> None:
-        """Synchronize all in-flight transfer events."""
+        """Synchronize queued and device-submitted transfers before reuse."""
+        drain = getattr(self._backend, "drain_submissions", None)
+        if drain is not None:
+            drain()
+        # Descriptor retention is backend-specific; CUDA has no release hook.
+        release = getattr(self._backend, "release_completed", None)
         for event_idx, event in self._load_events:
             event.synchronize()
+            if release is not None:
+                release(is_store=False, event_idx=event_idx)
             self._load_hwm = event_idx
         self._load_events.clear()
 
         for event_idx, event in self._store_events:
             event.synchronize()
+            if release is not None:
+                release(is_store=True, event_idx=event_idx)
             self._store_hwm = event_idx
         self._store_events.clear()
 
@@ -300,12 +313,15 @@ class SimpleCPUOffloadWorker:
         """Non-blocking poll for completed events and return the high-water mark."""
         events = self._store_events if is_store else self._load_events
         hwm = self._store_hwm if is_store else self._load_hwm
+        release = getattr(self._backend, "release_completed", None)
         while events:
             event_idx, event = events[0]
             if not event.query():
                 break
             hwm = event_idx
             events.pop(0)
+            if release is not None:
+                release(is_store=is_store, event_idx=event_idx)
         if is_store:
             self._store_hwm = hwm
         else:

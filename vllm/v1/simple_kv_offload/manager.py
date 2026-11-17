@@ -13,6 +13,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
 from vllm.v1.core.kv_cache_coordinator import (
     KVCacheCoordinator,
     get_kv_cache_coordinator,
@@ -36,6 +37,11 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def _get_group_token_span(spec: Any, cp_world_size: int) -> int:
+    compress_ratio = max(int(getattr(spec, "compress_ratio", 1) or 1), 1)
+    return int(spec.block_size) * cp_world_size * compress_ratio
 
 
 @dataclass
@@ -101,15 +107,12 @@ class SimpleCPUOffloadScheduler:
                 self.fa_gidx = g_idx
                 break
         assert 0 <= self.fa_gidx < len(self.cpu_kv_cache_config.kv_cache_groups)
-        # FA group's own block_size; divides scheduler_block_size (the LCM)
-        # but is NOT assumed to equal it.
-        self.fa_block_size: int = (
-            self.cpu_kv_cache_config.kv_cache_groups[
-                self.fa_gidx
-            ].kv_cache_spec.block_size
-            * self.cp_world_size
+        # FA group's compression- and CP-aware token span divides the
+        # scheduler block size (the LCM), but is NOT assumed to equal it.
+        self.fa_block_size = _get_group_token_span(
+            self.cpu_kv_cache_config.kv_cache_groups[self.fa_gidx].kv_cache_spec,
+            self.cp_world_size,
         )
-        assert self.block_size % self.fa_block_size == 0
 
         logger.info(
             "SimpleCPUOffloadScheduler: Allocating %d CPU blocks (%.2f GB, mode=%s)",
@@ -168,6 +171,7 @@ class SimpleCPUOffloadScheduler:
         self._reqs_to_store: dict[str, StoreRequestState] = {}
         self._store_event_to_reqs: dict[int, list[str]] = {}
         self._in_flight_store_gpu_blocks: set[int] = set()
+        self._stale_store_identity_skips = 0
         self._abandoned_reqs_to_load: dict[str, LoadRequestState] = {}
 
         # Event counters
@@ -320,14 +324,10 @@ class SimpleCPUOffloadScheduler:
             return
 
         if pending is None:
-            logger.warning(
-                "SimpleCPUOffloadScheduler: update_state_after_alloc called "
-                "for req_id=%s with num_external_tokens=%d but no pending "
-                "CPU hit from get_num_new_matched_tokens(); skipping load.",
-                req_id,
-                num_external_tokens,
+            raise ValueError(
+                f"req={req_id}: num_external_tokens={num_external_tokens} "
+                "but no pending CPU hit to load"
             )
-            return
 
         cpu_hit_blocks_full, _ = pending
 
@@ -351,8 +351,8 @@ class SimpleCPUOffloadScheduler:
         # the rest will be released along with the temp pin below.
         cpu_hit_blocks: list[list[KVCacheBlock]] = []
         for g in range(num_groups):
-            g_block_size = (
-                kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
+            g_block_size = _get_group_token_span(
+                kv_cache_groups[g].kv_cache_spec, self.cp_world_size
             )
             assert num_external_tokens % g_block_size == 0, (
                 f"num_external_tokens={num_external_tokens} not aligned to "
@@ -371,15 +371,19 @@ class SimpleCPUOffloadScheduler:
             if n_ext_g == 0:
                 continue
 
-            # Number of blocks in the computed range for this group.
-            g_block_size = (
-                kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
+            group_gpu_ids = block_ids_by_group[g]
+            g_block_size = _get_group_token_span(
+                kv_cache_groups[g].kv_cache_spec, self.cp_world_size
             )
             n_computed_g = cdiv(total_computed_tokens, g_block_size)
-
-            # Back-trace: ext blocks sit at the tail of the computed range.
             gpu_ext_start = n_computed_g - n_ext_g
-            group_gpu_ids = block_ids_by_group[g]
+            if gpu_ext_start < 0 or gpu_ext_start + n_ext_g > len(group_gpu_ids):
+                self._free_pending_cpu_hit(pending)
+                raise ValueError(
+                    f"req={req_id} group={g}: external GPU block range "
+                    f"[{gpu_ext_start}, {gpu_ext_start + n_ext_g}) exceeds "
+                    f"group block count={len(group_gpu_ids)}"
+                )
 
             for i, cpu_blk in enumerate(cpu_blocks_g):
                 # Skip null blocks (e.g. sliding window or mamba padding).
@@ -388,6 +392,15 @@ class SimpleCPUOffloadScheduler:
                 gpu_block_ids.append(group_gpu_ids[gpu_ext_start + i])
                 cpu_block_ids.append(cpu_blk.block_id)
                 cpu_blocks_to_touch.append(cpu_blk)
+
+        # Reject an invalid hit before taking transfer pins. Otherwise the
+        # scheduler waits for a load that was never registered.
+        if not gpu_block_ids:
+            self._free_pending_cpu_hit(pending)
+            raise ValueError(
+                f"req={req_id}: num_external_tokens={num_external_tokens} "
+                "but no non-null CPU blocks to load"
+            )
 
         # Touch CPU blocks to prevent eviction during async load.
         self.cpu_block_pool.touch(cpu_blocks_to_touch)
@@ -594,8 +607,6 @@ class SimpleCPUOffloadScheduler:
             # Confirmed tokens: KV data written and visible to all streams.
             req = state.request
             confirmed_tokens = req.num_computed_tokens - req.num_output_placeholders
-            # Cap to blocks with confirmed KV data.
-            aligned_tokens = confirmed_tokens // self.block_size * self.block_size
 
             for g in range(num_groups):
                 # FIXME (yifan): handle CPU cache eviction, where
@@ -604,13 +615,13 @@ class SimpleCPUOffloadScheduler:
                 already_stored_g = state.num_stored_blocks[g]
                 group_gpu_ids = block_ids_by_group[g]
 
-                g_block_size = (
-                    kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
+                g_block_size = _get_group_token_span(
+                    kv_cache_groups[g].kv_cache_spec, self.cp_world_size
                 )
-                ready_blocks_g = aligned_tokens // g_block_size
+                ready_blocks_g = confirmed_tokens // g_block_size
                 scannable = group_gpu_ids[already_stored_g:ready_blocks_g]
 
-                for gpu_block_id in scannable:
+                for logical_idx, gpu_block_id in enumerate(scannable, already_stored_g):
                     gpu_block = gpu_block_pool.blocks[gpu_block_id]
                     if gpu_block.is_null:
                         advanced_per_group[g] += 1
@@ -620,6 +631,25 @@ class SimpleCPUOffloadScheduler:
                     if bhash_with_group is None:
                         # Masked-out SWA position the coordinator chose not to
                         # hash; it can never serve a prefix-cache hit, so skip.
+                        advanced_per_group[g] += 1
+                        continue
+
+                    # SWA eviction can leave an old physical ID in this cursor.
+                    # A's confirmed tokens do not prove a reused page for B is
+                    # computed. Validate its logical identity before pin/store.
+                    hash_idx = (logical_idx + 1) * g_block_size // self.hash_block_size - 1
+                    expected_hash = (
+                        make_block_hash_with_group_id(req.block_hashes[hash_idx], g)
+                        if 0 <= hash_idx < len(req.block_hashes) else None
+                    )
+                    if bhash_with_group != expected_hash:
+                        self._stale_store_identity_skips += 1
+                        if self._stale_store_identity_skips <= 8:
+                            logger.warning(
+                                "Skipped stale offload store identity: req=%s group=%d "
+                                "logical=%d physical=%d confirmed=%d",
+                                req_id, g, logical_idx, gpu_block_id, confirmed_tokens,
+                            )
                         advanced_per_group[g] += 1
                         continue
 
