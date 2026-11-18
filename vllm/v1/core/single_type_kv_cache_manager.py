@@ -264,9 +264,16 @@ class SingleTypeKVCacheManager(ABC):
             return
 
         req_blocks = self.req_to_blocks[request_id]
-        allocated_blocks = self.block_pool.get_new_blocks(
+        num_blocks_to_alloc = (
             cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
         )
+        if num_blocks_to_alloc <= 0:
+            # The request's block list already covers (or exceeds) the computed
+            # tokens (e.g. null-padded skipped blocks), so there are no external
+            # blocks to allocate. Passing a non-positive count to get_new_blocks
+            # would inflate the free-list counter via popleft_n(n<0).
+            return
+        allocated_blocks = self.block_pool.get_new_blocks(num_blocks_to_alloc)
         req_blocks.extend(allocated_blocks)
         if type(self.kv_cache_spec) in (
             FullAttentionSpec,
